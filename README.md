@@ -20,6 +20,18 @@ one batch; the remaining 25 emails were resumed from cache successfully.
 Fifteen offline tests pass. The two Zero resource downloads are byte-identical,
 so only one source file is used. Sarah accepted the field and row design.
 
+## Implementation brief
+
+Implementation assistant: Codex. Reusable coding prompt:
+
+> Write a Python script that reads all 300 emails and uses a free OpenRouter model
+> to extract payment details. Read the full thread, keep old and new accounts
+> separate, and leave missing details blank. Keep one row per distinct payment
+> with its source email ID. Use Pydantic to validate the data and Pandas to save
+> the table. Check forwarded emails, account changes and emails with two payments.
+
+The exact extraction-model prompt is the `PROMPT` constant in `extractor.py`.
+
 ## Setup and run
 
 Use Python 3.11 or newer. From this folder:
