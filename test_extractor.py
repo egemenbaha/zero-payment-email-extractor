@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 from extractor import (BatchResult, EmailResult, Payment, SOURCE_COLUMNS, load_source,
-                       request_batch, table_rows, validate_batch, write_results)
+                       apply_corrections, request_batch, table_rows, validate_batch, write_results)
 
 
 def source(email_id="EM-00008", body=None):
@@ -26,6 +26,36 @@ def payment(**updates):
 
 
 class ExtractorTests(unittest.TestCase):
+    def test_reviewed_correction_keeps_audit_trail_and_rejects_drift(self):
+        result = EmailResult(email_id="EM-00008", payments=[payment()], issues=[])
+        rows = table_rows(result, source(), "offline-test")
+        correction = {"email_id": "EM-00008", "payment_index": 1, "field": "payment_date",
+                      "expected": "2026-09-04", "value": None, "reason": "Test correction"}
+        apply_corrections(rows, [correction])
+        self.assertIsNone(rows[0]["payment_date"])
+        self.assertEqual(rows[0]["extraction_status"], "needs_review")
+        self.assertIn("2026-09-04", rows[0]["source_review_corrections"])
+        with self.assertRaises(ValueError):
+            apply_corrections(rows, [correction])
+
+    def test_missing_reference_uses_single_explicit_source_label(self):
+        result = EmailResult(email_id="EM-00008", payments=[payment(reference=None)], issues=[])
+        row = table_rows(result, source(), "offline-test")[0]
+        self.assertEqual(row["reference"], "8841")
+        self.assertEqual(row["reference_source"], "explicit_source_label")
+
+    def test_conflicting_references_are_not_guessed(self):
+        email = source(body=source()["email_body"] + " Ref OTHER-22.")
+        result = EmailResult(email_id="EM-00008", payments=[payment(reference=None)], issues=[])
+        row = table_rows(result, email, "offline-test")[0]
+        self.assertIsNone(row["reference"])
+        self.assertEqual(row["reference_source"], "missing")
+
+    def test_success_message_is_not_an_issue(self):
+        result = EmailResult(email_id="EM-00008", payments=[payment()], issues=["No issues"])
+        self.assertEqual(result.issues, [])
+        self.assertEqual(table_rows(result, source(), "offline-test")[0]["extraction_status"], "extracted")
+
     def test_preserves_compound_bank_account(self):
         result = EmailResult(email_id="EM-00008", payments=[payment()], issues=[])
         row = table_rows(result, source(), "offline-test")[0]

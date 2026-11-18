@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -11,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from threading import Lock
 import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -72,6 +74,13 @@ class EmailResult(StrictModel):
     payments: list[Payment]
     issues: list[str]
 
+    @field_validator("issues")
+    @classmethod
+    def remove_no_issue_messages(cls, values: list[str]) -> list[str]:
+        # Some models return a literal success message in this list.
+        return [value for value in values if value.strip().lower().rstrip(".") not in
+                {"", "no issues", "none", "no issues found"}]
+
 
 class BatchResult(StrictModel):
     emails: list[EmailResult]
@@ -96,7 +105,19 @@ account is absent. Include a verbatim account_change_evidence quote. If no chang
 is mentioned, use false and null evidence; this does not mean the account is trusted.
 Do not invent saved account records, verification, payment approval or hold decisions.
 If no payment can be extracted, return an empty payments list and explain in issues.
+Use an empty issues array [] when there are no issues, never a success message.
 """
+
+_request_lock = Lock()
+_last_request = 0.0
+
+
+def pace_request() -> None:
+    """Space request starts to remain below 20 requests per minute."""
+    global _last_request
+    with _request_lock:
+        time.sleep(max(0, 3.2 - (time.monotonic() - _last_request)))
+        _last_request = time.monotonic()
 
 
 def load_source(path: Path, expected: int) -> list[dict[str, str]]:
@@ -134,6 +155,14 @@ def source_issues(payment: Payment, source: dict[str, str]) -> list[str]:
     return issues
 
 
+def explicit_reference(source: dict[str, str]) -> str | None:
+    """Recover a single labeled reference without choosing between conflicting IDs."""
+    text = source["subject"] + "\n" + source["email_body"]
+    candidates = set(re.findall(r"\bRef[.:]?\s+([A-Za-z0-9][A-Za-z0-9/-]*)", text, re.I))
+    candidates.update(re.findall(r"\binvoice\s+([A-Za-z]{0,5}-?[0-9][A-Za-z0-9/-]*)", text, re.I))
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
 def validate_batch(raw: dict, batch: list[dict[str, str]]) -> BatchResult:
     parsed = BatchResult.model_validate(raw)
     actual = [item.email_id for item in parsed.emails]
@@ -152,7 +181,8 @@ def request_batch(batch: list[dict[str, str]], key: str, model: str) -> tuple[di
         "messages": [{"role": "system", "content": PROMPT},
                      {"role": "user", "content": json.dumps(batch, ensure_ascii=False)}],
         "temperature": 0,
-        "max_tokens": 10000,
+        "max_tokens": 16000,
+        "reasoning": {"enabled": False},
         "provider": {"require_parameters": True, "max_price": {"prompt": 0, "completion": 0}},
         "response_format": {"type": "json_schema", "json_schema": {
             "name": "payment_batch", "strict": True, "schema": BatchResult.model_json_schema()}},
@@ -162,6 +192,7 @@ def request_batch(batch: list[dict[str, str]], key: str, model: str) -> tuple[di
     # Bounded retry; never retry authentication, credits, or rate-limit errors blindly.
     for attempt in range(3):
         try:
+            pace_request()
             with urlopen(request, timeout=180) as response:
                 envelope = json.load(response)
             if "error" in envelope:
@@ -191,6 +222,11 @@ def table_rows(result: EmailResult, source: dict[str, str], model: str) -> list[
     rows = []
     seen = set()
     for index, payment in enumerate(result.payments, 1):
+        reference_source = "model" if payment.reference is not None else "missing"
+        fallback = explicit_reference(source) if payment.reference is None else None
+        if fallback is not None:
+            payment = payment.model_copy(update={"reference": fallback})
+            reference_source = "explicit_source_label"
         issues = list(result.issues) + source_issues(payment, source)
         signature = payment.model_dump_json()
         if signature in seen:
@@ -201,12 +237,39 @@ def table_rows(result: EmailResult, source: dict[str, str], model: str) -> list[
         if absent:
             issues.append("Missing payment details: " + ", ".join(absent))
         rows.append({**common, "payment_index": index, **payment.model_dump(),
+                     "reference_source": reference_source,
                      "extraction_status": "needs_review" if issues else "extracted",
                      "extraction_issues": json.dumps(issues, ensure_ascii=False), "model": model})
     return rows
 
 
-def write_results(source: list[dict], completed: dict[str, tuple[EmailResult, str]], out: Path) -> dict:
+def apply_corrections(rows: list[dict], corrections: list[dict]) -> None:
+    """Apply explicit source-reviewed corrections while retaining their before/after record."""
+    for correction in corrections:
+        matches = [row for row in rows if row["email_id"] == correction["email_id"]
+                   and row["payment_index"] == correction["payment_index"]]
+        if not matches or matches[0]["extraction_status"] == "not_processed":
+            continue
+        if len(matches) != 1 or correction["field"] not in PAYMENT_COLUMNS:
+            raise ValueError("Correction target is invalid or ambiguous")
+        row = matches[0]
+        field = correction["field"]
+        if row[field] != correction["expected"]:
+            raise ValueError("Correction no longer matches the original model value")
+        amended = {name: row[name] for name in PAYMENT_COLUMNS}
+        amended[field] = correction["value"]
+        Payment.model_validate(amended)
+        row[field] = correction["value"]
+        row["source_review_corrections"] = json.dumps(correction, ensure_ascii=False)
+        issues = json.loads(row["extraction_issues"])
+        issues = [issue for issue in issues if issue != f"{field} is not a verbatim source span"]
+        issues.append("Source review: " + correction["reason"])
+        row["extraction_issues"] = json.dumps(issues, ensure_ascii=False)
+        row["extraction_status"] = "needs_review"
+
+
+def write_results(source: list[dict], completed: dict[str, tuple[EmailResult, str]], out: Path,
+                  corrections: list[dict] | None = None) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     rows = []
     for email in source:
@@ -217,6 +280,7 @@ def write_results(source: list[dict], completed: dict[str, tuple[EmailResult, st
             rows.extend(table_rows(EmailResult(email_id=email["email_id"], payments=[],
                                               issues=["Not processed"]), email, ""))
             rows[-1]["extraction_status"] = "not_processed"
+    apply_corrections(rows, corrections or [])
     frame = pd.DataFrame(rows)
     frame.to_csv(out / "payments.csv", index=False)
     summary = {
@@ -238,14 +302,22 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("results"))
     parser.add_argument("--key-file", type=Path, help="Read an existing local secret file without logging its contents")
     parser.add_argument("--model", default=os.getenv("OPENROUTER_MODEL", "openrouter/free"))
-    parser.add_argument("--batch-size", type=int, default=10, choices=range(1, 11))
+    parser.add_argument("--batch-size", type=int, default=10, choices=range(1, 26))
+    parser.add_argument("--workers", type=int, default=1, choices=range(1, 4))
     parser.add_argument("--expected-emails", type=int, default=300)
     parser.add_argument("--max-batches", type=int, help="Optional smoke-test limit")
+    parser.add_argument("--review-corrections", type=Path, help="Optional audited source corrections")
     parser.add_argument("--inspect", action="store_true", help="Validate and describe source without using API")
     args = parser.parse_args()
     if args.max_batches is not None and args.max_batches < 1:
         parser.error("--max-batches must be positive")
     source = load_source(args.input, args.expected_emails)
+    corrections = []
+    if args.review_corrections:
+        reviewed = json.loads(args.review_corrections.read_text())
+        if reviewed["source_sha256"] != hashlib.sha256(args.input.read_bytes()).hexdigest():
+            raise ValueError("Corrections belong to a different source file")
+        corrections = reviewed["corrections"]
     if args.inspect:
         print(json.dumps({"emails": len(source), "unique_email_ids": len({r['email_id'] for r in source}),
                           "forwarded": sum(r['is_forwarded_thread'] == 'true' for r in source)}, indent=2))
@@ -265,27 +337,36 @@ def main() -> int:
             result = validate_batch({"emails": [saved["result"]]}, [record]).emails[0]
             completed[record["email_id"]] = (result, saved["model"])
     pending = [r for r in source if r["email_id"] not in completed]
-    batch_count = 0
+    batches = [pending[start:start + args.batch_size] for start in range(0, len(pending), args.batch_size)]
+    if args.max_batches is not None:
+        batches = batches[:args.max_batches]
+    failure = None
     try:
-        for start in range(0, len(pending), args.batch_size):
-            if args.max_batches is not None and batch_count >= args.max_batches:
-                break
-            batch = pending[start:start + args.batch_size]
-            raw, actual_model = request_batch(batch, key, args.model)
-            parsed = validate_batch(raw, batch)
-            for result in parsed.emails:
-                saved = {"result": result.model_dump(), "model": actual_model}
-                path = cache / (result.email_id + ".json")
-                temporary = path.with_suffix(".tmp")
-                temporary.write_text(json.dumps(saved, ensure_ascii=False))
-                temporary.replace(path)
-                completed[result.email_id] = (result, actual_model)
-            batch_count += 1
-            print(f"Processed {len(completed)}/{len(source)} emails", flush=True)
-            time.sleep(3.1)
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(request_batch, batch, key, args.model): batch for batch in batches}
+            for future in as_completed(futures):
+                if future.cancelled():
+                    continue
+                try:
+                    raw, actual_model = future.result()
+                    parsed = validate_batch(raw, futures[future])
+                    for result in parsed.emails:
+                        saved = {"result": result.model_dump(), "model": actual_model}
+                        path = cache / (result.email_id + ".json")
+                        temporary = path.with_suffix(".tmp")
+                        temporary.write_text(json.dumps(saved, ensure_ascii=False))
+                        temporary.replace(path)
+                        completed[result.email_id] = (result, actual_model)
+                    print(f"Processed {len(completed)}/{len(source)} emails", flush=True)
+                except Exception as exc:
+                    failure = exc
+                    for other in futures:
+                        other.cancel()
     finally:
-        summary = write_results(source, completed, args.output)
+        summary = write_results(source, completed, args.output, corrections)
         print(json.dumps(summary, indent=2))
+    if failure is not None:
+        raise failure
     return 0 if summary["complete_api_run"] else 2
 
 

@@ -1,0 +1,22 @@
+{
+  "source_sha256": "55279909ea1c388192cd57eadd164c848261ba83b3619dba41ba6f8c579fd073",
+  "reviewed_by": "AI assistant comparing the extracted table with source email text",
+  "corrections": [
+    {
+      "email_id": "EM-00261",
+      "payment_index": 1,
+      "field": "payee",
+      "expected": "Underwood Payroll Clearing",
+      "value": "Underwood Payroll",
+      "reason": "The source names Underwood Payroll. The model added the unsupported word Clearing; it was removed to match the email exactly."
+    },
+    {
+      "email_id": "EM-00291",
+      "payment_index": 2,
+      "field": "payment_date",
+      "expected": "2026-11-20",
+      "value": null,
+      "reason": "The second payment sentence does not state a payment date. The model copied the date from the first payment, so it was removed rather than assumed to apply to both."
+    }
+  ]
+}

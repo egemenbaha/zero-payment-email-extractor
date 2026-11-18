@@ -1,0 +1,30 @@
+{
+  "source_emails": 300,
+  "represented_emails": 300,
+  "missing_source_ids": [],
+  "unexpected_source_ids": [],
+  "duplicate_payment_keys": 0,
+  "amount_currency_coverage_mismatches": [],
+  "account_change_keyword_candidates": [
+    "EM-00012",
+    "EM-00024",
+    "EM-00025",
+    "EM-00036",
+    "EM-00048",
+    "EM-00072",
+    "EM-00088",
+    "EM-00104",
+    "EM-00120",
+    "EM-00140",
+    "EM-00156",
+    "EM-00168",
+    "EM-00192",
+    "EM-00204",
+    "EM-00256",
+    "EM-00276",
+    "EM-00300"
+  ],
+  "account_change_candidates_not_flagged": [],
+  "review_rows": 5,
+  "limitations": "Independent coverage checks, not proof of all semantic mappings. Keyword matching may miss unfamiliar account-change wording. Identical repeated amounts are deduplicated for this audit only."
+}
