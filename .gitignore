@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+*api-key*
+*.key
+.venv/
+__pycache__/
+.DS_Store
+data/
+results/
+.cache/
